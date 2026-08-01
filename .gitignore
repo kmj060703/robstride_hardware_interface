@@ -1,0 +1,34 @@
+# Compiled object files / libraries
+*.o
+*.obj
+*.so
+*.so.*
+*.a
+*.lai
+*.la
+*.lo
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+CMakeScripts/
+cmake_install.cmake
+install_manifest.txt
+compile_commands.json
+CTestTestfile.cmake
+Testing/
+
+# colcon/ament workspace artifacts (in case this repo is ever built in place)
+build/
+install/
+log/
+COLCON_IGNORE
+AMENT_IGNORE
+
+# Editors
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
