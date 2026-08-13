@@ -1,15 +1,18 @@
-// Copyright 2026
-// Apache License, Version 2.0
+// Copyright 2026 Minjo Kim
+// SPDX-License-Identifier: Apache-2.0
 
 #ifndef ROBSTRIDE_HARDWARE_INTERFACE__ROBSTRIDE_HARDWARE_INTERFACE_HPP_
 #define ROBSTRIDE_HARDWARE_INTERFACE__ROBSTRIDE_HARDWARE_INTERFACE_HPP_
 
+#include <atomic>
 #include <memory>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
 #include "rclcpp/rclcpp.hpp"
+#include "rclcpp/executors/single_threaded_executor.hpp"
 
 #include "hardware_interface/handle.hpp"
 #include "hardware_interface/hardware_info.hpp"
@@ -25,6 +28,7 @@
 #include "robstride_interfaces/srv/get_data_from_robstride.hpp"
 #include "robstride_interfaces/srv/set_data_to_robstride.hpp"
 #include "robstride_interfaces/srv/set_zero_robstride.hpp"
+#include "robstride_interfaces/srv/reboot_robstride.hpp"
 #include "std_srvs/srv/set_bool.hpp"
 
 #include "realtime_tools/realtime_publisher.hpp"
@@ -35,18 +39,17 @@ namespace robstride_hardware_interface
 struct JointHandle
 {
   std::string joint_name;
+  // <gpio> block holding this motor's device configuration.
+  std::string gpio_name;
   uint8_t id;
   std::string can_interface;
   robstride_sdk::ActuatorType actuator_type;
-  double kp;
-  double kd;
+  robstride_sdk::RunMode control_mode = robstride_sdk::RunMode::RUN_MODE_MOTION;
   robstride_sdk::RobstrideMotor * motor;  // owned by RobstrideHardware::motors_
 };
 
-/// @brief ros2_control SystemInterface for RobStride actuators over
-/// SocketCAN. Owns one robstride_sdk::CanBus per distinct `can_interface`
-/// used across the hardware's joints, so multi-bus setups (e.g. one bus per
-/// quadruped leg) work by giving joints different `can_interface` params.
+// ros2_control SystemInterface for RobStride actuators over SocketCAN.
+// Owns one CanBus per distinct can_interface, so multi-bus rigs work.
 class RobstrideHardware : public hardware_interface::SystemInterface, public rclcpp::Node
 {
 public:
@@ -83,8 +86,38 @@ private:
   std::vector<double> hw_cmd_velocity_;
   std::vector<double> hw_cmd_effort_;
 
+  // <gpio> interfaces: runtime-writable gains and per-motor health.
+  std::vector<double> hw_cmd_kp_;
+  std::vector<double> hw_cmd_kd_;
+  std::vector<double> hw_state_temperature_;
+  std::vector<double> hw_state_run_state_;
+  std::vector<double> hw_state_fault_bits_;
+
+  // Gain changes parked by SetDataCallback (service thread) and applied by
+  // write() (RT thread), which owns hw_cmd_kp_/hw_cmd_kd_.
+  std::vector<std::atomic<double>> pending_kp_;
+  std::vector<std::atomic<double>> pending_kd_;
+  std::vector<std::atomic<bool>> has_pending_kp_;
+  std::vector<std::atomic<bool>> has_pending_kd_;
+
   uint8_t master_id_ = 0xFD;
   double error_timeout_ms_ = 4000.0;
+  // While inactive the buses are closed, so missing feedback is expected
+  // and read() must not escalate it.
+  bool is_active_ = false;
+  // true: hold the remaining joints and ignore commands when one is lost.
+  // false: return ERROR so the whole component is deactivated.
+  bool freeze_on_joint_loss_ = true;
+  // Latched on the first loss, cleared only by a fresh activation.
+  bool frozen_ = false;
+  // Positions held while frozen, captured at the moment of the loss.
+  std::vector<double> freeze_position_;
+  // When write() last sent this joint its re-enable burst. Rate limited to
+  // stay inside the bus budget; see kRecoveryResendNs.
+  std::vector<uint64_t> last_recovery_ns_;
+  // Set by SetTorqueCallback (service thread), consumed by write(), which
+  // sends the actual Enable/Disable frames.
+  std::atomic<bool> torque_enabled_desired_{true};
 
   using RobstrideStateMsg = robstride_interfaces::msg::RobstrideState;
   using StatePublisher = realtime_tools::RealtimePublisher<RobstrideStateMsg>;
@@ -95,6 +128,12 @@ private:
   rclcpp::Service<robstride_interfaces::srv::SetDataToRobstride>::SharedPtr set_data_srv_;
   rclcpp::Service<robstride_interfaces::srv::SetZeroRobstride>::SharedPtr set_zero_srv_;
   rclcpp::Service<std_srvs::srv::SetBool>::SharedPtr set_torque_srv_;
+  rclcpp::Service<robstride_interfaces::srv::RebootRobstride>::SharedPtr reboot_srv_;
+
+  // Services are spun on their own thread: spinning inside read() would
+  // stall the RT loop for the duration of any slow callback.
+  rclcpp::executors::SingleThreadedExecutor::SharedPtr service_executor_;
+  std::thread service_executor_thread_;
 
   void GetDataCallback(
     const std::shared_ptr<robstride_interfaces::srv::GetDataFromRobstride::Request> request,
@@ -108,8 +147,12 @@ private:
   void SetTorqueCallback(
     const std::shared_ptr<std_srvs::srv::SetBool::Request> request,
     std::shared_ptr<std_srvs::srv::SetBool::Response> response);
+  void RebootCallback(
+    const std::shared_ptr<robstride_interfaces::srv::RebootRobstride::Request> request,
+    std::shared_ptr<robstride_interfaces::srv::RebootRobstride::Response> response);
 
   JointHandle * FindJointById(uint8_t id);
+  const hardware_interface::ComponentInfo * FindGpio(const std::string & name) const;
 };
 
 }  // namespace robstride_hardware_interface
