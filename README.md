@@ -2,70 +2,92 @@
 
 ## 1. Introduction
 
-ROS 2 package providing a [ros2_control](https://github.com/ros-controls/ros2_control) `hardware_interface::SystemInterface` plugin for [RobStride](https://www.robstride.com/) CAN actuators (RS00/RS01/RS02/RS03/RS04/RS05/RS06), built on top of [robstride_sdk](https://github.com/kmj060703/RobstrideSDK) and [robstride_interfaces](https://github.com/kmj060703/robstride_interfaces) — the RobStride equivalent of ROBOTIS's `dynamixel_hardware_interface` for Dynamixel servos.
+A [ros2_control](https://github.com/ros-controls/ros2_control) `hardware_interface::SystemInterface` plugin for [RobStride](https://www.robstride.com/) CAN actuators (RS00–RS06), built on [robstride_sdk](https://github.com/kmj060703/RobstrideSDK) and [robstride_interfaces](https://github.com/kmj060703/robstride_interfaces).
 
-Sustains a **≥300 Hz** control loop: `read()`/`write()` never block on CAN I/O (they only touch `robstride_sdk`'s lock-free per-motor state and batch-send via `sendmmsg()`), so the update rate is limited by real CAN bus bandwidth, not by request/response round trips. See [robstride_sdk's README](https://github.com/kmj060703/RobstrideSDK/blob/main/README.md#1-introduction) for the I/O design.
+`read()` and `write()` never block on CAN I/O — they touch only the SDK's lock-free per-motor state and batch outgoing frames through `sendmmsg()`. The achievable update rate is therefore bounded by CAN bus bandwidth rather than by request/response round trips; see §10.
 
 ## 2. Prerequisites
 
-- ROS 2 Jazzy (this workspace).
-- Hardware: a SocketCAN-compatible adapter (e.g. a canable/candlelight USB-CAN adapter) per bus, RobStride motors wired to it, and a power supply for the motors.
-- `robstride_sdk`, `robstride_interfaces` built in the same workspace.
+- ROS 2 Jazzy
+- A SocketCAN adapter per bus (e.g. a canable/candlelight USB-CAN), RobStride motors, and a motor power supply
+- `robstride_sdk` and `robstride_interfaces` in the same workspace
 
 ## 3. Installation
 
-1. Clone the repositories into your ROS workspace:
+```bash
+cd ~/${WORKSPACE}/src
+git clone https://github.com/kmj060703/RobstrideSDK.git
+git clone https://github.com/kmj060703/robstride_hardware_interface.git
+git clone https://github.com/kmj060703/robstride_interfaces.git
 
-   ```bash
-   cd ~/${WORKSPACE}/src
-   git clone https://github.com/kmj060703/RobstrideSDK.git
-   git clone https://github.com/kmj060703/robstride_hardware_interface.git
-   git clone https://github.com/kmj060703/robstride_interfaces.git
-   ```
-
-2. Build the packages:
-
-   ```bash
-   cd ~/${WORKSPACE}
-   colcon build --packages-select robstride_sdk robstride_interfaces robstride_hardware_interface
-   ```
-
-3. Source your workspace:
-
-   ```bash
-   source ~/${WORKSPACE}/install/setup.bash
-   ```
+cd ~/${WORKSPACE}
+colcon build --packages-select robstride_sdk robstride_interfaces robstride_hardware_interface
+source install/setup.bash
+```
 
 ## 4. CAN interface setup
 
 RobStride motors run at 1 Mbps. Bring each interface up before launching:
 
 ```bash
-./scripts/setup_can.sh can0                 # defaults: 1 Mbps, txqueuelen 1000
+./scripts/setup_can.sh can0                 # 1 Mbps, txqueuelen 1000
 ./scripts/setup_can.sh can0 1000000 1000    # explicit bitrate / txqueuelen
 ```
 
-Some USB-CAN controllers (including many gs_usb/candlelight-based canable adapters) don't support automatic bus-off recovery (`restart-ms`) — the script detects this and falls back to configuring without it, logging a warning. If that happens, a bus-off event needs a manual `down`/`up` cycle to recover.
+`txqueuelen` matters: activation sends a burst of several frames per motor, and the kernel default of 10 is small enough to drop most of it on a rig of any size.
 
-## 5. Configuration (`ros2_control` xacro)
+Many gs_usb/candlelight adapters do not support bus-off auto-recovery (`restart-ms`); the script detects this and continues without it. On those adapters a bus-off event needs a manual `down`/`up` cycle, or the adapter re-plugged. The symptom is `SendFrames()` failing with `ENOBUFS` while the interface still reports `UP`, which the plugin logs explicitly rather than letting it surface as every motor going silent.
 
-Hardware-level params:
+## 5. Configuration
+
+### Hardware parameters
 
 | Param | Meaning | Default |
 |---|---|---|
-| `master_id` | Host CAN id used as source address in outgoing frames | `253` (`0xFD`) |
-| `error_timeout_ms` | Max time without fresh feedback before a joint is treated as stale/faulted (also arms each motor's own `CAN_TIMEOUT` watchdog, param `0x7028`) | `4000` |
+| `master_id` | Host CAN id used as the source address of outgoing frames | `253` (`0xFD`) |
+| `number_of_joints` | Optional cross-check against the number of `<joint>` blocks | (unchecked) |
+| `error_timeout_ms` | Time without fresh feedback before a joint counts as lost. Also the value each motor's own `CAN_TIMEOUT` watchdog (`0x7028`) is armed with | `4000` |
+| `freeze_on_joint_loss` | See §6 | `true` |
+| `torque_enable` | Whether activation engages torque. `false` brings the rig up readable but limp: joints report state and can be moved by hand until `~/set_torque` is called | `true` |
 
-Per-joint params:
+### Joints and gpios
+
+Each motor is described twice, separating the two things that are otherwise easy to confuse:
+
+- **`<joint>`** — the `ros2_control` contract: which motor id it drives, which command interface it is driven through, which states it reports.
+- **`<gpio>`** — the motor as a device: model, bus, run mode and gains, plus interfaces for reading health and retuning gains at runtime.
+
+The two are matched by id — a joint's `id` must equal some gpio's `ID`, and `on_init` refuses to start otherwise.
+
+Joint params:
 
 | Param | Meaning |
 |---|---|
-| `id` | Motor's CAN id |
-| `can_interface` | SocketCAN interface name this joint's motor is on (e.g. `can0`) — different joints may use different buses, e.g. one per quadruped leg |
-| `actuator_type` | `"00"`..`"06"` / `"0"`..`"6"` / `"RS00"`..`"RS06"` |
-| `kp`, `kd` | Position/velocity gains sent with every motion-control frame |
+| `id` | Motor's CAN id. Must match a gpio's `ID`. |
 
-Example (see the `qdd_description` package's `robstride_ros2_control.xacro` for the full macro):
+gpio params:
+
+| Param | Meaning |
+|---|---|
+| `type` | `robstride` |
+| `ID` | Motor's CAN id |
+| `can_interface` | SocketCAN interface this motor is on. Motors may use different buses, e.g. one per quadruped leg. |
+| `actuator_type` | `"00"`..`"06"`, `"0"`..`"6"`, or `"RS00"`..`"RS06"` |
+| `control_mode` | `motion` (default), `position_pp`, `velocity`, `current`, `position_csp` |
+| `kp`, `kd` | Initial gains. `motion` mode only; the other modes are closed by the motor's own loops. |
+
+gpio interfaces:
+
+| Interface | Kind | Meaning |
+|---|---|---|
+| `kp`, `kd` | command | Retune gains while running. Same destination as `~/set_data_to_robstride`. |
+| `temperature` | state | Motor temperature (°C) |
+| `run_state` | state | `RunState` enum (`2` = torqued) |
+| `fault_bits` | state | Latched fault word |
+
+**The joint's command interface must match its gpio's `control_mode`**: `velocity` mode is driven through `velocity`, `current` through `effort`, and the position modes through `position`. `on_init` rejects any other pairing — a controller claiming an interface the joint's mode never writes would claim it successfully and then achieve nothing, with no error to explain why the joint does not move.
+
+Only declared interfaces are exported, so a joint cannot be claimed through an interface it did not declare.
 
 ```xml
 <ros2_control name="robstride" type="system">
@@ -74,68 +96,124 @@ Example (see the `qdd_description` package's `robstride_ros2_control.xacro` for 
     <param name="master_id">253</param>
     <param name="error_timeout_ms">4000</param>
   </hardware>
+
   <joint name="rs_joint1">
     <param name="id">1</param>
-    <param name="can_interface">can0</param>
-    <param name="actuator_type">00</param>
-    <param name="kp">5.0</param>
-    <param name="kd">0.3</param>
-    <command_interface name="position"/>
     <command_interface name="velocity"/>
-    <command_interface name="effort"/>
     <state_interface name="position"/>
     <state_interface name="velocity"/>
     <state_interface name="effort"/>
   </joint>
-  <!-- ... -->
+
+  <gpio name="rs1">
+    <param name="type">robstride</param>
+    <param name="ID">1</param>
+    <param name="actuator_type">00</param>
+    <param name="can_interface">can0</param>
+    <param name="control_mode">velocity</param>
+    <param name="kp">5.0</param>
+    <param name="kd">0.3</param>
+    <command_interface name="kp"/>
+    <command_interface name="kd"/>
+    <state_interface name="temperature"/>
+    <state_interface name="run_state"/>
+    <state_interface name="fault_bits"/>
+  </gpio>
 </ros2_control>
 ```
 
-For a bench/CI test without real hardware, swap the `<hardware>` block for `mock_components/GenericSystem` (see `qdd_bringup`'s `use_mock_robstride:=true` launch arg).
+A joint driven through `velocity` should be `type="continuous"` in the URDF, not `revolute`. With command limit enforcement on, a `revolute` joint that ends up outside its position limits has its velocity clamped to zero in **both** directions, including the one that would bring it back, so any overshoot is unrecoverable without intervention. Position-commanded joints are unaffected: their commands are clamped to the limit rather than zeroed, which drives them back into range.
 
-## 6. Activation behavior (safety)
+For a bench test without hardware, swap the `<hardware>` block for `mock_components/GenericSystem`.
 
-`on_activate()` does not blindly seed command interfaces at 0:
+## 6. Activation and joint loss
 
-1. Opens each CAN bus and starts its read thread.
-2. Sends an Enable frame to every joint, then waits (up to `error_timeout_ms`) for each motor to actually report `run_state == MOTOR` — resending Enable every 200 ms in case the first frame was dropped, since CAN is fire-and-forget.
-3. Only once every joint confirms, seeds each command interface from that joint's real measured position — not 0 — so `write()`'s first cycle holds position instead of snapping toward a stale target.
-4. If any joint fails to confirm within the timeout, disables whatever did confirm, tears down the buses, and returns `ERROR` instead of `SUCCESS`.
+### Activation never produces motion
 
-`read()` and `write()` both check each joint's `last_update_ns` against `error_timeout_ms`: `read()` returns `ERROR` (triggering `controller_manager` to deactivate) if any joint has gone stale, and `write()` independently substitutes a Disable frame for any stale or faulted joint instead of continuing to send a motion-control command toward a possibly outdated target.
+Engaging torque may only ever mean "hold where you already are". The closed-loop modes keep their target inside the motor, in RAM that survives a deactivate/reactivate cycle, so enabling with a stale `loc_ref` still loaded would make the motor servo back to wherever it was last aimed. `on_activate()` therefore preloads every target before any torque exists:
 
-## 7. Topics and services
+1. Open each bus and start its read thread.
+2. Arm each motor's `CAN_TIMEOUT` watchdog and select its `run_mode`.
+3. Send a Stop frame to every motor and wait for the reply. Stop is answered with the same Type-2 feedback as any other command, so this doubles as a position probe that cannot move anything — and it also clears any torque left on by a run that died before `on_deactivate`.
+4. Preload each mode's target (`loc_ref` / `spd_ref` / `iq_ref`) from that measured position, and seed the command interfaces from the same reading.
+5. If `torque_enable` is `false`, stop here: the motors stay readable and free to move.
+6. Otherwise send Enable and wait up to `error_timeout_ms` for each motor to report `run_state == MOTOR`, resending every 200 ms since CAN frames are fire-and-forget.
+7. If any joint never confirms, disable everything, tear down the buses and return `ERROR`.
+
+If a joint reports no position in step 3, activation is refused rather than engaging torque against an unknown target.
+
+### Losing a joint
+
+A joint counts as lost once `error_timeout_ms` passes without fresh feedback. With `freeze_on_joint_loss` at its default of `true`, the component **freezes**:
+
+- The lost joint is disabled. (Its own `CAN_TIMEOUT` watchdog has usually released torque already.)
+- Every reachable joint keeps torque and holds the position it had at the moment of the loss.
+- Controller commands are ignored, since the controllers are advancing setpoints against partly unknown state.
+- `read()` returns `OK`, so nothing is torn down and no controllers are deactivated.
+
+The freeze is latched. Reconnecting restores torque to the recovered joint but does **not** hand control back — a link that dropped once can drop again, and the controllers' setpoints have moved on in the meantime. Only a fresh activation resumes control.
+
+Setting `freeze_on_joint_loss` to `false` restores the conventional behavior: `read()` returns `ERROR`, the framework deactivates the component, and torque is cut on every joint.
+
+Independently of this, `write()` substitutes a Disable frame for any joint that is stale or reporting a fault, rather than continuing to drive it toward a possibly outdated target. While a joint is untorqued, `read()` tracks its command position to its measured position, so it re-engages targeting where it actually is.
+
+**Position feedback wraps at ±4π** — a firmware characteristic, not something this driver adds. See [robstride_sdk's README](https://github.com/kmj060703/RobstrideSDK/blob/main/README.md#5-actuator-models-and-limits) for what that means for continuously-rotating joints.
+
+## 7. Services and active controllers
+
+`~/set_torque` and `~/set_zero_robstride` talk only to the motor. Neither knows about, nor can override, whichever controller currently claims the command interface — an active `joint_trajectory_controller` keeps writing its own held setpoint every cycle regardless. Deactivate it first:
+
+```bash
+ros2 control switch_controllers --deactivate robstride_controller --controller-manager /robstride/controller_manager
+ros2 service call /robstride/robstride_hardware_interface/set_torque std_srvs/srv/SetBool "{data: false}"
+# ... move the joint by hand, call set_zero_robstride, etc ...
+ros2 service call /robstride/robstride_hardware_interface/set_torque std_srvs/srv/SetBool "{data: true}"
+ros2 control switch_controllers --activate robstride_controller --controller-manager /robstride/controller_manager
+```
+
+`joint_trajectory_controller` reads the measured position when it activates, so it resumes from wherever the joint actually ended up.
+
+`~/set_zero_robstride` is the more dangerous of the two, for a different reason. It moves nothing itself, but it redefines what zero means at the joint's current position. If a controller is holding a setpoint of, say, `3.0` at that moment, the physical spot that used to read `3.0` now reads `0.0`, and the controller — still chasing the literal number — drives the motor somewhere new to match. The motion comes entirely from the controller reacting to the reference frame shifting underneath it.
+
+## 8. Topics and services
 
 All under the hardware component's own node namespace (`~`):
 
 | Name | Type | Description |
 |---|---|---|
 | `~/robstride_state` | `robstride_interfaces/msg/RobstrideState` | Per-joint id/enabled/run_state/fault_bits, published every `read()` cycle |
-| `~/get_data_from_robstride` | `robstride_interfaces/srv/GetDataFromRobstride` | Read live telemetry (position/velocity/torque/temperature/run_state/fault_bits) for one motor |
-| `~/set_data_to_robstride` | `robstride_interfaces/srv/SetDataToRobstride` | Set `kp`/`kd`, or write an arbitrary RobStride parameter index |
+| `~/get_data_from_robstride` | `robstride_interfaces/srv/GetDataFromRobstride` | Read live telemetry for one motor |
+| `~/set_data_to_robstride` | `robstride_interfaces/srv/SetDataToRobstride` | Set `kp`/`kd`, or write an arbitrary parameter index |
 | `~/set_zero_robstride` | `robstride_interfaces/srv/SetZeroRobstride` | Set a motor's mechanical zero |
 | `~/set_torque` | `std_srvs/srv/SetBool` | Enable/disable all configured motors |
+| `~/reboot_robstride` | `robstride_interfaces/srv/RebootRobstride` | Clear a motor's latched fault so it can re-enable. Unconditional: the caller decides which faults are safe to clear. |
 
-See [robstride_interfaces' README](https://github.com/kmj060703/robstride_interfaces/blob/main/README.md) for full field descriptions.
+See [robstride_interfaces' README](https://github.com/kmj060703/robstride_interfaces/blob/main/README.md) for field descriptions.
 
-## 8. Bus bandwidth
+## 9. Threading model
 
-A single 1 Mbps CAN bus has a hard throughput ceiling, and it's shared across every motor on that bus. Each `read`+`write` cycle needs `2 · N_motors` frames round-tripped (one motion-control command out, one feedback frame back, per motor); an 8-byte extended CAN frame takes roughly 130–190 µs on the wire at 1 Mbps depending on bit-stuffing, so a rough estimate of bus utilization is:
+This plugin inherits `rclcpp::Node` for the services above, so it has to spin itself. That spinning runs on its own executor thread (`service_executor_`, started in `on_init`), independent of the RT cycle.
+
+An earlier version called `rclcpp::spin_some()` at the end of `read()` instead. That ran every callback synchronously inside the RT cycle, and a callback that blocked for a few seconds froze `read()`/`write()` for that whole duration — long enough for the resulting CAN silence to trip this plugin's own staleness check and force-deactivate the hardware.
+
+The tradeoff is that state shared between a callback and the RT cycle is now touched by two genuinely concurrent threads. Service callbacks must not write the RT cycle's plain buffers directly; they park values in an atomic that `write()` picks up (see `pending_kp_` and `torque_enabled_desired_`).
+
+## 10. Bus bandwidth
+
+A 1 Mbps CAN bus is shared by every motor on it. Each cycle needs `2 · N_motors` frames — one command out, one feedback frame back per motor — and an 8-byte extended frame takes roughly 130–190 µs on the wire depending on bit stuffing:
 
 ```
 utilization ≈ 2 · N_motors · update_rate_hz · frame_time_s
 ```
 
-This is only an estimate — actual overhead depends on your specific adapter, motor count, and any other traffic sharing the bus (parameter services, etc). **Always measure your own setup** before trusting a given `update_rate`:
+Measure rather than trust the estimate:
 
 ```bash
-# 1) bring the interface up (see section 4) and activate the hardware
-# 2) count real frames/sec on the wire for a short window:
-timeout 1 candump can0 | wc -l
+canbusload can0@1000000 -r -t -b -e
 ```
 
-Compare that count against `2 · N_motors · update_rate_hz` — if it's meaningfully short of that target, or if you see `read()`/`write()` staleness errors (section 6) under load, the bus is saturated and `update_rate` (or the number of motors on that bus) needs to come down. There's no universal safe number: more motors per bus, a slower/higher-overhead adapter, or added service traffic all lower the ceiling. Leave headroom rather than tuning right up to the saturation point — a bus running near 100% utilization has no margin for retries, parameter reads/writes, or momentary bus noise, and can start intermittently missing the `error_timeout_ms` deadline.
+If utilization is near saturation, or staleness errors appear under load, reduce `update_rate` or the number of motors per bus. Leave headroom: a bus at 100% has no margin for retries, parameter writes, or momentary noise, and starts intermittently missing the `error_timeout_ms` deadline.
 
-## 9. License
+## 11. License
 
 Apache License 2.0.
