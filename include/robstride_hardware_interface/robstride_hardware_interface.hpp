@@ -45,6 +45,8 @@ struct JointHandle
   std::string can_interface;
   robstride_sdk::ActuatorType actuator_type;
   robstride_sdk::RunMode control_mode = robstride_sdk::RunMode::RUN_MODE_MOTION;
+  // +1 or -1: joint frame = direction * motor frame (position/velocity/effort).
+  double direction = 1.0;
   robstride_sdk::RobstrideMotor * motor;  // owned by RobstrideHardware::motors_
 };
 

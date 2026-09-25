@@ -75,6 +75,7 @@ gpio params:
 | `actuator_type` | `"00"`..`"06"`, `"0"`..`"6"`, or `"RS00"`..`"RS06"` |
 | `control_mode` | `motion` (default), `position_pp`, `velocity`, `current`, `position_csp` |
 | `kp`, `kd` | Initial gains. `motion` mode only; the other modes are closed by the motor's own loops. |
+| `direction` | `1` (default) or `-1`. Joint frame = `direction` × motor frame for position, velocity and effort, so a motor mounted opposite to the URDF axis needs no model change. Raw parameter writes through `~/set_data_to_robstride` stay in the motor frame. |
 
 gpio interfaces:
 

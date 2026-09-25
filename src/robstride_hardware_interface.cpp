@@ -8,6 +8,7 @@
 #include <cstring>
 #include <limits>
 #include <set>
+#include <stdexcept>
 #include <thread>
 
 namespace robstride_hardware_interface
@@ -199,6 +200,10 @@ CallbackReturn RobstrideHardware::on_init(
       jh.control_mode = robstride_sdk::RunModeFromString(GetJointParam(*gpio, "control_mode", ""));
       hw_cmd_kp_[i] = std::stod(GetJointParam(*gpio, "kp", "0.0"));
       hw_cmd_kd_[i] = std::stod(GetJointParam(*gpio, "kd", "0.0"));
+      jh.direction = std::stod(GetJointParam(*gpio, "direction", "1"));
+      if (jh.direction != 1.0 && jh.direction != -1.0) {
+        throw std::invalid_argument("direction must be 1 or -1");
+      }
     } catch (const std::exception & e) {
       RCLCPP_ERROR_STREAM(logger_, "gpio '" << gpio->name << "': " << e.what());
       return CallbackReturn::ERROR;
@@ -437,8 +442,8 @@ CallbackReturn RobstrideHardware::on_activate(
     }
 
     // Seed the command interfaces from the same reading.
-    hw_state_position_[i] = measured;
-    hw_cmd_position_[i] = measured;
+    hw_state_position_[i] = jh.direction * measured;
+    hw_cmd_position_[i] = hw_state_position_[i];
     hw_cmd_velocity_[i] = 0.0;
     hw_cmd_effort_[i] = 0.0;
   }
@@ -529,7 +534,8 @@ CallbackReturn RobstrideHardware::on_activate(
   // Seed the command interfaces from measured state so write()'s first
   // cycle holds position instead of snapping to 0.
   for (size_t i = 0; i < joints_.size(); ++i) {
-    hw_state_position_[i] = joints_[i].motor->state().position.load(std::memory_order_relaxed);
+    hw_state_position_[i] =
+      joints_[i].direction * joints_[i].motor->state().position.load(std::memory_order_relaxed);
     hw_cmd_position_[i] = hw_state_position_[i];
     hw_cmd_velocity_[i] = 0.0;
     hw_cmd_effort_[i] = 0.0;
@@ -569,9 +575,10 @@ return_type RobstrideHardware::read(
   const uint64_t now_ns = robstride_sdk::NowNs();
   for (size_t i = 0; i < joints_.size(); ++i) {
     const robstride_sdk::MotorState & st = joints_[i].motor->state();
-    hw_state_position_[i] = st.position.load(std::memory_order_relaxed);
-    hw_state_velocity_[i] = st.velocity.load(std::memory_order_relaxed);
-    hw_state_effort_[i] = st.torque.load(std::memory_order_relaxed);
+    const double dir = joints_[i].direction;
+    hw_state_position_[i] = dir * st.position.load(std::memory_order_relaxed);
+    hw_state_velocity_[i] = dir * st.velocity.load(std::memory_order_relaxed);
+    hw_state_effort_[i] = dir * st.torque.load(std::memory_order_relaxed);
     hw_state_temperature_[i] = st.temperature.load(std::memory_order_relaxed);
     hw_state_run_state_[i] =
       static_cast<double>(st.run_state.load(std::memory_order_relaxed));
@@ -732,9 +739,11 @@ return_type RobstrideHardware::write(
     // Motion mode uses the combined Type-1 frame; the other modes are
     // driven by writing their own target parameter. While frozen the
     // controllers are not in charge, so hold the captured position.
-    const double target_position = frozen_ ? freeze_position_[i] : hw_cmd_position_[i];
-    const double target_velocity = frozen_ ? 0.0 : hw_cmd_velocity_[i];
-    const double target_effort = frozen_ ? 0.0 : hw_cmd_effort_[i];
+    // Controllers speak the joint frame; the motor gets direction * command.
+    const double target_position =
+      jh.direction * (frozen_ ? freeze_position_[i] : hw_cmd_position_[i]);
+    const double target_velocity = jh.direction * (frozen_ ? 0.0 : hw_cmd_velocity_[i]);
+    const double target_effort = jh.direction * (frozen_ ? 0.0 : hw_cmd_effort_[i]);
 
     can_frame frame{};
     switch (jh.control_mode) {
@@ -856,6 +865,7 @@ void RobstrideHardware::SetDataCallback(
   }
 
   // Otherwise treat item_name as a RobStride parameter index and write it.
+  // Raw passthrough in the motor frame: gpio direction is not applied.
   try {
     const uint16_t index = static_cast<uint16_t>(std::stoul(request->item_name, nullptr, 0));
     const auto it = buses_.find(jh->can_interface);
