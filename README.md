@@ -114,6 +114,7 @@ Only declared interfaces are exported, so a joint cannot be claimed through an i
     <param name="control_mode">velocity</param>
     <param name="kp">5.0</param>
     <param name="kd">0.3</param>
+    <param name="direction">-1</param>
     <command_interface name="kp"/>
     <command_interface name="kd"/>
     <state_interface name="temperature"/>
