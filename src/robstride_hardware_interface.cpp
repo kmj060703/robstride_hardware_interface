@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cmath>
 #include <cstring>
 #include <limits>
 #include <set>
@@ -72,6 +73,20 @@ uint32_t CanTimeoutRaw(double error_timeout_ms)
 {
   return std::max(1u, static_cast<uint32_t>(std::min(error_timeout_ms * 20.0, 100000.0)));
 }
+
+constexpr double kTwoPi = 2.0 * M_PI;
+
+// Map x into [center - pi, center + pi).
+double WrapToWindow(double x, double center)
+{
+  return x - kTwoPi * std::floor((x - center + M_PI) / kTwoPi);
+}
+
+bool IsEnabled(const robstride_sdk::MotorState & st)
+{
+  return st.run_state.load(std::memory_order_relaxed) ==
+         static_cast<uint8_t>(robstride_sdk::RunState::MOTOR);
+}
 }  // namespace
 
 CallbackReturn RobstrideHardware::on_init(
@@ -130,6 +145,8 @@ CallbackReturn RobstrideHardware::on_init(
   hw_cmd_position_.assign(n, 0.0);
   hw_cmd_velocity_.assign(n, 0.0);
   freeze_position_.assign(n, 0.0);
+  wrap_offset_.assign(n, 0.0);
+  seen_enabled_.assign(n, false);
   last_recovery_ns_.assign(n, 0);
   hw_cmd_effort_.assign(n, 0.0);
   hw_cmd_kp_.assign(n, 0.0);
@@ -209,6 +226,24 @@ CallbackReturn RobstrideHardware::on_init(
       return CallbackReturn::ERROR;
     }
     jh.can_interface = can_if;
+
+    // A single-turn reading can only be placed unambiguously inside a
+    // window narrower than one turn, so center it on the joint's range.
+    const auto lim = info_.limits.find(joint.name);
+    if (lim != info_.limits.end() && lim->second.has_position_limits) {
+      const double lower = lim->second.min_position;
+      const double upper = lim->second.max_position;
+      jh.wrap_center = 0.5 * (lower + upper);
+      if (upper - lower >= kTwoPi) {
+        RCLCPP_WARN_STREAM(
+          logger_,
+          "Joint '" << joint.name << "' spans " << (upper - lower) << " rad, a full turn or "
+            "more: its position is reported modulo 2*pi around " << jh.wrap_center <<
+            ", so the ends of its range alias onto each other.");
+      }
+    } else {
+      jh.continuous = true;
+    }
 
     // The declared command interface must be the one this mode writes, or
     // a controller would claim it and the joint would never move.
@@ -356,6 +391,7 @@ CallbackReturn RobstrideHardware::on_activate(
 {
   // Reactivation is the only way out of a freeze; see read().
   frozen_ = false;
+  std::fill(seen_enabled_.begin(), seen_enabled_.end(), false);
 
   for (auto & kv : buses_) {
     if (!kv.second->Open()) {
@@ -442,7 +478,7 @@ CallbackReturn RobstrideHardware::on_activate(
     }
 
     // Seed the command interfaces from the same reading.
-    hw_state_position_[i] = jh.direction * measured;
+    hw_state_position_[i] = WrapMotorPosition(i, measured);
     hw_cmd_position_[i] = hw_state_position_[i];
     hw_cmd_velocity_[i] = 0.0;
     hw_cmd_effort_[i] = 0.0;
@@ -535,7 +571,7 @@ CallbackReturn RobstrideHardware::on_activate(
   // cycle holds position instead of snapping to 0.
   for (size_t i = 0; i < joints_.size(); ++i) {
     hw_state_position_[i] =
-      joints_[i].direction * joints_[i].motor->state().position.load(std::memory_order_relaxed);
+      WrapMotorPosition(i, joints_[i].motor->state().position.load(std::memory_order_relaxed));
     hw_cmd_position_[i] = hw_state_position_[i];
     hw_cmd_velocity_[i] = 0.0;
     hw_cmd_effort_[i] = 0.0;
@@ -570,13 +606,14 @@ return_type RobstrideHardware::read(
   const rclcpp::Time & time, const rclcpp::Duration & /*period*/)
 {
   bool any_fault = false;
-  bool any_stale = false;
-  std::string stale_joints;
+  bool any_lost = false;
+  std::string lost_joints;
   const uint64_t now_ns = robstride_sdk::NowNs();
+  const bool torque_desired = torque_enabled_desired_.load(std::memory_order_relaxed);
   for (size_t i = 0; i < joints_.size(); ++i) {
     const robstride_sdk::MotorState & st = joints_[i].motor->state();
     const double dir = joints_[i].direction;
-    hw_state_position_[i] = dir * st.position.load(std::memory_order_relaxed);
+    hw_state_position_[i] = WrapMotorPosition(i, st.position.load(std::memory_order_relaxed));
     hw_state_velocity_[i] = dir * st.velocity.load(std::memory_order_relaxed);
     hw_state_effort_[i] = dir * st.torque.load(std::memory_order_relaxed);
     hw_state_temperature_[i] = st.temperature.load(std::memory_order_relaxed);
@@ -588,9 +625,8 @@ return_type RobstrideHardware::read(
 
     // While untorqued, track the command to the measured position so the
     // motor has a fresh target the instant it re-engages.
-    if (st.run_state.load(std::memory_order_relaxed) !=
-      static_cast<uint8_t>(robstride_sdk::RunState::MOTOR))
-    {
+    const bool enabled = IsEnabled(st);
+    if (!enabled) {
       hw_cmd_position_[i] = hw_state_position_[i];
       hw_cmd_velocity_[i] = 0.0;
       hw_cmd_effort_[i] = 0.0;
@@ -603,16 +639,30 @@ return_type RobstrideHardware::read(
       continue;
     }
 
+    // A joint that was enabled and no longer is has rebooted (a power blip
+    // clears its RAM) or faulted. Its position may now be a whole turn off
+    // and a controller may still hold a setpoint from before, so this is a
+    // loss even when it answers again well inside error_timeout_ms.
+    bool dropped_out = false;
+    if (!torque_desired) {
+      seen_enabled_[i] = false;
+    } else if (enabled) {
+      seen_enabled_[i] = true;
+    } else {
+      dropped_out = seen_enabled_[i];
+    }
+
     const uint64_t last_ns = st.last_update_ns.load(std::memory_order_relaxed);
     const double elapsed_ms = ElapsedMsSinceUpdate(now_ns, last_ns);
-    if (elapsed_ms < 0.0 || elapsed_ms > error_timeout_ms_) {
-      any_stale = true;
+    const bool stale = elapsed_ms < 0.0 || elapsed_ms > error_timeout_ms_;
+    if (stale || dropped_out) {
+      any_lost = true;
       // Collected, not logged here: _THROTTLE suppresses per call site, so
       // logging in the loop would hide all but one joint.
-      if (!stale_joints.empty()) {
-        stale_joints += ", ";
+      if (!lost_joints.empty()) {
+        lost_joints += ", ";
       }
-      stale_joints += joints_[i].joint_name;
+      lost_joints += joints_[i].joint_name + (stale ? " (stale)" : " (left enabled state)");
     }
   }
 
@@ -634,11 +684,11 @@ return_type RobstrideHardware::read(
 
   // Services are spun on their own thread; no spin_some() on this cycle.
 
-  if (!any_stale && !frozen_) {
+  if (!any_lost && !frozen_) {
     return return_type::OK;
   }
 
-  if (!any_stale) {
+  if (!any_lost) {
     // Frozen but reporting again. Not resumed automatically: a link that
     // dropped once can drop again, and the controllers' setpoints moved on.
     RCLCPP_WARN_STREAM_THROTTLE(
@@ -651,7 +701,7 @@ return_type RobstrideHardware::read(
   if (!freeze_on_joint_loss_) {
     RCLCPP_ERROR_STREAM_THROTTLE(
       logger_, *this->rclcpp::Node::get_clock(), 1000,
-      "Feedback stale on [" << stale_joints << "]; deactivating hardware");
+      "Lost [" << lost_joints << "]; deactivating hardware");
     return return_type::ERROR;
   }
 
@@ -664,13 +714,14 @@ return_type RobstrideHardware::read(
     }
     RCLCPP_ERROR_STREAM(
       logger_,
-      "Feedback stale on [" << stale_joints << "]; holding all reachable joints at their "
-        "current position and ignoring controller commands. Reactivate the hardware "
-        "component to resume control once the cause has been dealt with.");
+      "Lost [" << lost_joints << "]; holding all reachable joints at their current "
+        "position and ignoring controller commands. A lost joint is not re-enabled. "
+        "Reactivate the hardware component to resume control once the cause has been "
+        "dealt with.");
   } else {
     RCLCPP_ERROR_STREAM_THROTTLE(
       logger_, *this->rclcpp::Node::get_clock(), 5000,
-      "Still frozen; feedback stale on [" << stale_joints << "]");
+      "Still frozen; lost [" << lost_joints << "]");
   }
   return return_type::OK;
 }
@@ -702,9 +753,14 @@ return_type RobstrideHardware::write(
       continue;
     }
 
-    const bool currently_enabled =
-      st.run_state.load(std::memory_order_relaxed) ==
-      static_cast<uint8_t>(robstride_sdk::RunState::MOTOR);
+    const bool currently_enabled = IsEnabled(st);
+    if (!currently_enabled && frozen_) {
+      // A joint that dropped out stays limp until the hardware is
+      // reactivated; re-enabling it here is what let a rebooted motor chase
+      // a stale setpoint. The Stop frame keeps its feedback coming.
+      frames_by_bus[jh.can_interface].push_back(jh.motor->EncodeDisable(false));
+      continue;
+    }
     if (!currently_enabled) {
       // Torque wanted but not confirmed: resend Enable, and run_mode with
       // it, since a brief power loss clears the motor's RAM. Rate-limited,
@@ -739,9 +795,9 @@ return_type RobstrideHardware::write(
     // Motion mode uses the combined Type-1 frame; the other modes are
     // driven by writing their own target parameter. While frozen the
     // controllers are not in charge, so hold the captured position.
-    // Controllers speak the joint frame; the motor gets direction * command.
+    // Controllers speak the joint frame; MotorTargetPosition() maps back.
     const double target_position =
-      jh.direction * (frozen_ ? freeze_position_[i] : hw_cmd_position_[i]);
+      MotorTargetPosition(i, frozen_ ? freeze_position_[i] : hw_cmd_position_[i]);
     const double target_velocity = jh.direction * (frozen_ ? 0.0 : hw_cmd_velocity_[i]);
     const double target_effort = jh.direction * (frozen_ ? 0.0 : hw_cmd_effort_[i]);
 
@@ -790,6 +846,26 @@ return_type RobstrideHardware::write(
         "own: re-plug the adapter and re-run scripts/setup_can.sh.");
   }
   return return_type::OK;
+}
+
+double RobstrideHardware::WrapMotorPosition(size_t i, double motor_position)
+{
+  const JointHandle & jh = joints_[i];
+  const double unwrapped = jh.direction * motor_position;
+  const double wrapped = WrapToWindow(unwrapped, jh.wrap_center);
+  wrap_offset_[i] = unwrapped - wrapped;
+  return wrapped;
+}
+
+double RobstrideHardware::MotorTargetPosition(size_t i, double joint_position) const
+{
+  const JointHandle & jh = joints_[i];
+  double delta = joint_position - hw_state_position_[i];
+  if (jh.continuous) {
+    // The same pose sits every 2*pi, so take the nearest one.
+    delta = WrapToWindow(delta, 0.0);
+  }
+  return jh.direction * (hw_state_position_[i] + wrap_offset_[i] + delta);
 }
 
 JointHandle * RobstrideHardware::FindJointById(uint8_t id)

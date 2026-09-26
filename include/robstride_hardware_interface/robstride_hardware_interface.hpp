@@ -47,6 +47,12 @@ struct JointHandle
   robstride_sdk::RunMode control_mode = robstride_sdk::RunMode::RUN_MODE_MOTION;
   // +1 or -1: joint frame = direction * motor frame (position/velocity/effort).
   double direction = 1.0;
+  // Reported position is wrapped into [wrap_center - pi, wrap_center + pi):
+  // the middle of the URDF limits, or 0 for a joint without them. A motor
+  // that power-cycles may come back a whole turn off, and this folds it back.
+  double wrap_center = 0.0;
+  // No URDF position limits: targets take the shortest way round.
+  bool continuous = false;
   robstride_sdk::RobstrideMotor * motor;  // owned by RobstrideHardware::motors_
 };
 
@@ -114,6 +120,13 @@ private:
   bool frozen_ = false;
   // Positions held while frozen, captured at the moment of the loss.
   std::vector<double> freeze_position_;
+  // Whole turns (joint frame) dropped when wrapping each joint's position;
+  // write() adds them back so targets land in the motor's own frame.
+  std::vector<double> wrap_offset_;
+  // Joint confirmed enabled since torque was last requested. Leaving the
+  // enabled state after that means the motor rebooted or faulted, not that
+  // it is still waiting for its first Enable.
+  std::vector<bool> seen_enabled_;
   // When write() last sent this joint its re-enable burst. Rate limited to
   // stay inside the bus budget; see kRecoveryResendNs.
   std::vector<uint64_t> last_recovery_ns_;
@@ -152,6 +165,12 @@ private:
   void RebootCallback(
     const std::shared_ptr<robstride_interfaces::srv::RebootRobstride::Request> request,
     std::shared_ptr<robstride_interfaces::srv::RebootRobstride::Response> response);
+
+  // Joint-frame position of joint i from a raw motor reading, wrapped into
+  // the joint's window. Records the dropped turns in wrap_offset_.
+  double WrapMotorPosition(size_t i, double motor_position);
+  // Motor-frame target for a joint-frame position target.
+  double MotorTargetPosition(size_t i, double joint_position) const;
 
   JointHandle * FindJointById(uint8_t id);
   const hardware_interface::ComponentInfo * FindGpio(const std::string & name) const;

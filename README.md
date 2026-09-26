@@ -146,18 +146,29 @@ If a joint reports no position in step 3, activation is refused rather than enga
 
 ### Losing a joint
 
-A joint counts as lost once `error_timeout_ms` passes without fresh feedback. With `freeze_on_joint_loss` at its default of `true`, the component **freezes**:
+A joint counts as lost when either:
 
-- The lost joint is disabled. (Its own `CAN_TIMEOUT` watchdog has usually released torque already.)
+- `error_timeout_ms` passes without fresh feedback, or
+- with torque requested, it leaves the enabled state after having been confirmed enabled. A motor whose supply blips reboots with torque off and can answer again well inside `error_timeout_ms`, so staleness alone would miss it. A fault that drops the motor out of the enabled state counts the same way.
+
+With `freeze_on_joint_loss` at its default of `true`, the component **freezes**:
+
+- The lost joint is disabled and is **not** re-enabled. (Its own `CAN_TIMEOUT` watchdog has usually released torque already.)
 - Every reachable joint keeps torque and holds the position it had at the moment of the loss.
 - Controller commands are ignored, since the controllers are advancing setpoints against partly unknown state.
 - `read()` returns `OK`, so nothing is torn down and no controllers are deactivated.
 
-The freeze is latched. Reconnecting restores torque to the recovered joint but does **not** hand control back — a link that dropped once can drop again, and the controllers' setpoints have moved on in the meantime. Only a fresh activation resumes control.
+The freeze is latched. A recovered joint stays limp and control is **not** handed back: a rebooted motor's position may be a whole turn off, a link that dropped once can drop again, and the controllers' setpoints have moved on in the meantime. Only a fresh activation resumes control. Because a fault now freezes too, `~/reboot_robstride` clears the fault but does not by itself bring the joint back; reactivate afterwards.
 
 Setting `freeze_on_joint_loss` to `false` restores the conventional behavior: `read()` returns `ERROR`, the framework deactivates the component, and torque is cut on every joint.
 
 Independently of this, `write()` substitutes a Disable frame for any joint that is stale or reporting a fault, rather than continuing to drive it toward a possibly outdated target. While a joint is untorqued, `read()` tracks its command position to its measured position, so it re-engages targeting where it actually is.
+
+### Position after a motor power cycle
+
+A motor only knows its angle within one turn when it powers up, so after a power cycle its reading can come back offset by a whole multiple of 2π. The reported `position` is therefore wrapped into a one-turn window centered on the middle of the joint's URDF limits (0 for a joint without position limits), and `write()` adds the dropped turns back before sending a target. A joint whose range is narrower than a full turn reads the same after a power cycle as before it. A joint without position limits is treated as continuous: its targets take the shortest way round.
+
+This recovers whole turns only. A mechanical zero the motor forgets across a power cycle shifts the reading by an arbitrary amount, and the wrapped value then looks plausible but is wrong. Make sure the zero is stored in the motor before relying on this.
 
 **Position feedback wraps at ±4π** — a firmware characteristic, not something this driver adds. See [robstride_sdk's README](https://github.com/kmj060703/RobstrideSDK/blob/main/README.md#5-actuator-models-and-limits) for what that means for continuously-rotating joints.
 
@@ -188,7 +199,7 @@ All under the hardware component's own node namespace (`~`):
 | `~/set_data_to_robstride` | `robstride_interfaces/srv/SetDataToRobstride` | Set `kp`/`kd`, or write an arbitrary parameter index |
 | `~/set_zero_robstride` | `robstride_interfaces/srv/SetZeroRobstride` | Set a motor's mechanical zero |
 | `~/set_torque` | `std_srvs/srv/SetBool` | Enable/disable all configured motors |
-| `~/reboot_robstride` | `robstride_interfaces/srv/RebootRobstride` | Clear a motor's latched fault so it can re-enable. Unconditional: the caller decides which faults are safe to clear. |
+| `~/reboot_robstride` | `robstride_interfaces/srv/RebootRobstride` | Clear a motor's latched fault. Unconditional: the caller decides which faults are safe to clear. The joint re-enables only after the hardware is reactivated (see §6). |
 
 See [robstride_interfaces' README](https://github.com/kmj060703/robstride_interfaces/blob/main/README.md) for field descriptions.
 
